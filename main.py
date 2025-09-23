@@ -54,7 +54,7 @@ def process_frame(frame, model, class_list, tracker, area1, area2, going_out, go
 def main():
     cv2.namedWindow('people_counter')
     cv2.setMouseCallback('people_counter', people_counter)
-    cap = cv2.VideoCapture('E:/yolov8-students-counting-lobby-main/video/p.mp4')
+    cap = cv2.VideoCapture('video/test_1.mp4')
 
     if not cap.isOpened():
         print("Error: Could not open video file.")
