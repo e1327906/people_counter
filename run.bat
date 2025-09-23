@@ -1,0 +1,1 @@
+D:/Projects/AI/people_counter/.venv/Scripts/python.exe main.py
