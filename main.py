@@ -14,11 +14,11 @@ import time
 AREA_CONFIG = {
     'type': 'horizontal',  # Options: 'vertical', 'horizontal', 'diagonal', 'custom'
     'extension': 500,    # How much to extend the areas (pixels)
-    'width': 30,         # Width of detection zones
+    'width': 150,        # VERY LARGE width to cover more vertical space - increased from 100 to 150
     'position': {        # Base position for areas
         'x_center': 500,
-        'y_center': 250,
-        'spacing': 80    # Distance between area1 and area2
+        'y_center': 250,  # Center of frame - people from top/bottom should cross here
+        'spacing': 30    # Reduced spacing further from 40 to 30 for better overlap
     }
 }
 
@@ -57,24 +57,24 @@ def generate_detection_areas(config):
         ]
         
     elif area_type == 'horizontal':
-        # Horizontal detection lines
-        x_left = pos['x_center'] - extension
-        x_right = pos['x_center'] + extension
+        # Horizontal detection lines - positioned for bottom area where people actually walk
+        x_left = 0  # Full width of frame
+        x_right = 1000
         
-        # Area1 is the upper horizontal line (for people entering from top)
+        # Area1 is the first crossing line (people coming from outside frame)
         area1 = [
-            (x_left, pos['y_center'] - width//2),
-            (x_left, pos['y_center'] + width//2),
-            (x_right, pos['y_center'] + width//2),
-            (x_right, pos['y_center'] - width//2)
+            (x_left, 400),   # Y=400 (upper line for bottom area)
+            (x_left, 430),   # Y=430 
+            (x_right, 430),
+            (x_right, 400)
         ]
         
-        # Area2 is the lower horizontal line (for people exiting to bottom)
+        # Area2 is the second crossing line 
         area2 = [
-            (x_left, pos['y_center'] + pos['spacing'] - width//2),
-            (x_left, pos['y_center'] + pos['spacing'] + width//2),
-            (x_right, pos['y_center'] + pos['spacing'] + width//2),
-            (x_right, pos['y_center'] + pos['spacing'] - width//2)
+            (x_left, 320),   # Y=320 (lower line - closer to detection area)
+            (x_left, 350),   # Y=350
+            (x_right, 350),
+            (x_right, 320)
         ]
         
     elif area_type == 'diagonal':
@@ -110,9 +110,20 @@ def load_class_list(file_path):
     with open(file_path, "r") as file:
         return file.read().split("\n")
 
+# Global tracking for person states
+person_states = {}
+
+class PersonState:
+    def __init__(self):
+        self.last_area = None  # 1 for area1, 2 for area2, None for neither
+        self.counted = False   # Prevent double counting
+        self.frames_since_count = 0
+
 def process_frame(frame, model, class_list, tracker, area1, area2, going_out, going_in, counter1, counter2, detection_type='vertical'):
+    global person_states
+    
     frame = cv2.resize(frame, (1020, 500), interpolation=cv2.INTER_AREA)
-    results = model.predict(frame)
+    results = model.predict(frame, classes=[0], verbose=False)  # Only detect persons (class 0), reduce verbose output
     boxes_data = results[0].boxes.data
     px = pd.DataFrame(boxes_data).astype("float")
 
@@ -124,83 +135,115 @@ def process_frame(frame, model, class_list, tracker, area1, area2, going_out, go
 
     objects_bbs_ids = tracker.update(detected_objects)
     
-    # Draw all detected people first (for debugging)
+    # Clean up states for people no longer detected
+    current_ids = [bbox[4] for bbox in objects_bbs_ids]
+    person_states = {k: v for k, v in person_states.items() if k in current_ids}
+    
+    # Process each detected person
     for bbox in objects_bbs_ids:
         x3, y3, x4, y4, obj_id = bbox
-        # Draw basic detection rectangle for all people
+        
+        # Initialize person state if new
+        if obj_id not in person_states:
+            person_states[obj_id] = PersonState()
+        
+        state = person_states[obj_id]
+        state.frames_since_count += 1
+        
+        # Draw basic detection rectangle
         cv2.rectangle(frame, (x3, y3), (x4, y4), (128, 128, 128), 1)
         cv2.putText(frame, f'ID:{obj_id}', (x3, y3-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
-        # Use multiple detection points for better accuracy
+        # Use center point for detection
         center_x = (x3 + x4) // 2
-        bottom_y = y4
         center_y = (y3 + y4) // 2
+        detection_point = (center_x, center_y)
         
-        detection_points = [
-            (center_x, bottom_y),      # Bottom center (feet)
-            (center_x, center_y),      # Body center
-            (center_x, y3 + 20)        # Upper body
-        ]
+        # Check which area the person is in
+        in_area1 = cv2.pointPolygonTest(np.array(area1, np.int32), detection_point, False) >= 0
+        in_area2 = cv2.pointPolygonTest(np.array(area2, np.int32), detection_point, False) >= 0
         
-        # Check if any detection point is in either area
-        in_area1 = any(cv2.pointPolygonTest(np.array(area1, np.int32), point, False) >= 0 for point in detection_points)
-        in_area2 = any(cv2.pointPolygonTest(np.array(area2, np.int32), point, False) >= 0 for point in detection_points)
+        # Determine current area - prioritize area1 if in both
+        current_area = None
+        if in_area1 and in_area2:
+            # If in both areas, use the one closest to center
+            dist1 = cv2.pointPolygonTest(np.array(area1, np.int32), detection_point, True)
+            dist2 = cv2.pointPolygonTest(np.array(area2, np.int32), detection_point, True)
+            current_area = 1 if abs(dist1) < abs(dist2) else 2
+            cv2.circle(frame, detection_point, 8, (255, 255, 0), -1)  # Yellow for overlapping
+        elif in_area1:
+            current_area = 1
+            cv2.circle(frame, detection_point, 6, (0, 255, 255), -1)  # Yellow dot
+        elif in_area2:
+            current_area = 2
+            cv2.circle(frame, detection_point, 6, (255, 0, 255), -1)  # Magenta dot
         
-        # Adjust detection logic based on area type
+        # Detection logic based on area transitions
         if detection_type == 'horizontal':
-            # For horizontal lines: detect top-to-bottom movement
             # Area1 is upper line, Area2 is lower line
             
-            # Track when person enters area1 (upper line)
-            if in_area1:
-                going_in[obj_id] = (center_x, bottom_y)
-                cv2.circle(frame, (center_x, bottom_y), 6, (0, 255, 255), -1)  # Yellow dot
-                
-            # Track when person enters area2 (lower line)  
-            if in_area2:
-                going_out[obj_id] = (center_x, bottom_y)
-                cv2.circle(frame, (center_x, bottom_y), 6, (255, 0, 255), -1)  # Magenta dot
-            
-            # Count when person goes from area1 to area2 (downward = IN)
-            if obj_id in going_in and in_area2:
-                cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 255, 0), 3)  # Green rectangle
-                cvzone.putTextRect(frame, f'IN-{obj_id}', (x3, y3-20), 1, 1)
-                if obj_id not in counter1:
-                    counter1.append(obj_id)
-                    print(f"Person {obj_id} counted as IN (downward)")
+            if state.last_area is not None and current_area is not None and state.last_area != current_area:
+                # Only count if enough frames have passed since last count
+                if state.frames_since_count > 5:
                     
-            # Count when person goes from area2 to area1 (upward = OUT)
-            if obj_id in going_out and in_area1:
-                cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 0, 255), 3)  # Red rectangle
-                cvzone.putTextRect(frame, f'OUT-{obj_id}', (x3, y3-20), 1, 1)
-                if obj_id not in counter2:
-                    counter2.append(obj_id)
-                    print(f"Person {obj_id} counted as OUT (upward)")
-                    
+                    if state.last_area == 1 and current_area == 2:  # area1 → area2 = IN
+                        cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 255, 0), 3)  # Green rectangle
+                        cvzone.putTextRect(frame, f'IN-{obj_id}', (x3, y3-20), 1, 1)
+                        if obj_id not in counter1:
+                            counter1.append(obj_id)
+                            state.counted = True
+                            state.frames_since_count = 0
+                            print(f"✅ Person {obj_id} counted as IN (area1→area2)")
+                            
+                    elif state.last_area == 2 and current_area == 1:  # area2 → area1 = OUT
+                        cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 0, 255), 3)  # Red rectangle
+                        cvzone.putTextRect(frame, f'OUT-{obj_id}', (x3, y3-20), 1, 1)
+                        if obj_id not in counter2:
+                            counter2.append(obj_id)
+                            state.counted = True
+                            state.frames_since_count = 0
+                            print(f"✅ Person {obj_id} counted as OUT (area2→area1)")
+                            
         else:
-            # Original vertical detection logic (improved)
-            if in_area2:
-                going_out[obj_id] = (center_x, bottom_y)
-                cv2.circle(frame, (center_x, bottom_y), 6, (255, 0, 255), -1)
-                
-            if in_area1:
-                going_in[obj_id] = (center_x, bottom_y)
-                cv2.circle(frame, (center_x, bottom_y), 6, (0, 255, 255), -1)
-            
-            # Count crossings
-            if obj_id in going_out and in_area1:
-                cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 255, 0), 3)
-                cvzone.putTextRect(frame, f'IN-{obj_id}', (x3, y3-20), 1, 1)
-                if obj_id not in counter1:
-                    counter1.append(obj_id)
-                    print(f"Person {obj_id} counted as IN")
+            # Vertical detection logic
+            if state.last_area is not None and current_area is not None and state.last_area != current_area:
+                if state.frames_since_count > 5:
+                    
+                    if state.last_area == 2 and current_area == 1:  # area2 → area1 = IN
+                        cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 255, 0), 3)
+                        cvzone.putTextRect(frame, f'IN-{obj_id}', (x3, y3-20), 1, 1)
+                        if obj_id not in counter1:
+                            counter1.append(obj_id)
+                            state.counted = True
+                            state.frames_since_count = 0
+                            print(f"✅ Person {obj_id} counted as IN")
 
-            if obj_id in going_in and in_area2:
-                cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 0, 255), 3)
-                cvzone.putTextRect(frame, f'OUT-{obj_id}', (x3, y3-20), 1, 1)
-                if obj_id not in counter2:
-                    counter2.append(obj_id)
-                    print(f"Person {obj_id} counted as OUT")
+                    elif state.last_area == 1 and current_area == 2:  # area1 → area2 = OUT
+                        cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 0, 255), 3)
+                        cvzone.putTextRect(frame, f'OUT-{obj_id}', (x3, y3-20), 1, 1)
+                        if obj_id not in counter2:
+                            counter2.append(obj_id)
+                            state.counted = True
+                            state.frames_since_count = 0
+                            print(f"✅ Person {obj_id} counted as OUT")
+        
+        # Update last area only when clearly in an area
+        if current_area is not None:
+            state.last_area = current_area
+            
+        # Show comprehensive debug info
+        debug_text = f'A:{current_area} L:{state.last_area} F:{state.frames_since_count}'
+        cv2.putText(frame, debug_text, (x3, y4+10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        
+        # Show position coordinates
+        pos_text = f'({center_x},{center_y})'
+        cv2.putText(frame, pos_text, (x3, y4+25), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
+        
+        # Print detailed info for people not in areas (to help reposition areas)
+        if current_area is None:
+            print(f"🔍 ID:{obj_id} at ({center_x},{center_y}) - NOT in any area (Area1: Y=235-265, Area2: Y=315-345)")
+        else:
+            print(f"✅ ID:{obj_id} at ({center_x},{center_y}) - IN Area{current_area}")
 
     return frame, len(counter1), len(counter2)
 
